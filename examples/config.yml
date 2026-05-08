@@ -1,0 +1,110 @@
+entryPoints:
+  web:
+    address: ":8000"
+    protocol: http
+  web-secure:
+    address: ":8443"
+    protocol: https
+  tcp-app:
+    address: ":9000"
+    protocol: tcp
+  udp-dns:
+    address: ":5353"
+    protocol: udp
+
+routers:
+  api_router:
+    rule: "Host(`api.example.com`) && PathPrefix(`/v1`)"
+    service: "api_service"
+    middlewares:
+      - rate-limit
+      - auth
+  web_router:
+    rule: "Host(`example.com`) && PathPrefix(`/`)"
+    service: "web_service"
+    middlewares:
+      - security-headers
+      - circuit-breaker
+  admin_router:
+    rule: "Host(`admin.example.com`)"
+    service: "admin_service"
+    tls:
+      certFile: "./certs/admin.pem"
+      keyFile: "./certs/admin-key.pem"
+
+services:
+  api_service:
+    loadBalancer:
+      algorithm: roundrobin
+      servers:
+        - url: "http://localhost:5000"
+        - url: "http://localhost:5001"
+  web_service:
+    loadBalancer:
+      servers:
+        - url: "http://localhost:8080"
+  admin_service:
+    loadBalancer:
+      servers:
+        - url: "http://localhost:9090"
+
+middlewares:
+  rate-limit:
+    rateLimit:
+      maxRequests: 100
+      windowSeconds: 1
+  auth:
+    basicAuth:
+      users:
+        admin: "$2y$10$..."
+        user: "password"
+  security-headers:
+    headers:
+      set:
+        X-Frame-Options: DENY
+        X-Content-Type-Options: nosniff
+        X-XSS-Protection: "1; mode=block"
+      remove:
+        - X-Powered-By
+  circuit-breaker:
+    circuitBreaker:
+      failureThreshold: 5
+      recoveryTimeout: 30.0
+  retry:
+    retry:
+      attempts: 3
+
+tls:
+  certificates:
+    - certFile: "./certs/example.pem"
+      keyFile: "./certs/example-key.pem"
+  acme:
+    email: "admin@example.com"
+    domains:
+      - "example.com"
+      - "*.example.com"
+    staging: true
+    certDir: "./certs"
+
+metrics:
+  enabled: true
+  path: "/metrics"
+
+healthcheck:
+  enabled: true
+  interval_seconds: 5
+  timeout_seconds: 2
+  path: "/health"
+
+providers:
+  consul:
+    address: "localhost:8500"
+    pollInterval: 30
+  kubernetes:
+    address: "https://kubernetes.default.svc"
+    namespace: "default"
+    pollInterval: 30
+
+dashboard:
+  enabled: true
+  address: ":8080"
