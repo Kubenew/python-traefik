@@ -7,6 +7,7 @@ A production-grade, Traefik-inspired reverse proxy implemented in Python using a
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![CI](https://github.com/Kubenew/python-traefik/actions/workflows/ci.yml/badge.svg)](https://github.com/Kubenew/python-traefik/actions)
 [![Ruff](https://img.shields.io/badge/code%20style-ruff-000000.svg)](https://github.com/astral-sh/ruff)
+[![Downloads](https://pepy.tech/badge/python-traefik)](https://pepy.tech/project/python-traefik)
 
 ## Demo
 
