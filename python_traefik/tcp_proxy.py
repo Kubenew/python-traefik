@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Callable, Optional
+from typing import Optional
 
 from .balancer import RoundRobinBalancer
 from .registry import ServiceRegistry
@@ -11,6 +11,8 @@ logger = logging.getLogger(__name__)
 
 
 class TCPProxy:
+    """Layer-4 TCP reverse proxy using asyncio streams."""
+
     def __init__(
         self,
         host: str,
@@ -25,113 +27,115 @@ class TCPProxy:
         self.service_name = service_name
         self.tls_context = tls_context
         self._server: Optional[asyncio.AbstractServer] = None
+        self._active_connections: int = 0
 
     async def start(self):
-        protocol_factory = lambda: self._create_protocol()
+        """Start the TCP proxy listener."""
+        kwargs = {"host": self.host, "port": self.port}
         if self.tls_context:
-            self._server = await asyncio.start_server(
-                protocol_factory, host=self.host, port=self.port, ssl=self.tls_context
-            )
-        else:
-            self._server = await asyncio.start_server(
-                protocol_factory, host=self.host, port=self.port
-            )
-        logger.info("TCP proxy listening on %s:%s (TLS=%s)", self.host, self.port, self.tls_context is not None)
+            kwargs["ssl"] = self.tls_context
+
+        self._server = await asyncio.start_server(
+            self._handle_connection, **kwargs
+        )
+        logger.info(
+            "TCP proxy listening on %s:%s (TLS=%s)",
+            self.host, self.port, self.tls_context is not None,
+        )
 
     async def stop(self):
+        """Stop the TCP proxy and drain active connections."""
         if self._server:
             self._server.close()
             await self._server.wait_closed()
+            logger.info("TCP proxy on %s:%s stopped", self.host, self.port)
 
-    def _create_protocol(self):
-        return _TCPProxyProtocol(self.registry, self.service_name)
+    async def _handle_connection(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ):
+        """Handle a single inbound TCP connection by proxying to a backend."""
+        self._active_connections += 1
+        client_addr = writer.get_extra_info("peername")
+        logger.debug("TCP connection from %s", client_addr)
 
-
-class _TCPProxyProtocol(asyncio.Protocol):
-    def __init__(self, registry: ServiceRegistry, service_name: str):
-        self.registry = registry
-        self.service_name = service_name
-        self._transport: Optional[asyncio.Transport] = None
-        self._remote_transport: Optional[asyncio.Transport] = None
-        self._remote_ready = asyncio.Event()
-        self._buffer = b""
-
-    def connection_made(self, transport: asyncio.Transport):
-        self._transport = transport
         service = self.registry.get_service(self.service_name)
         backend = service.balancer.next_backend()
         if not backend:
-            logger.warning("No healthy backend for %s", self.service_name)
-            transport.close()
+            logger.warning("No healthy backend for TCP service %s", self.service_name)
+            writer.close()
+            await writer.wait_closed()
+            self._active_connections -= 1
             return
-        self._connect_remote(backend.url)
 
-    def _connect_remote(self, url: str):
-        host, port = _parse_tcp_addr(url)
-        coro = asyncio.get_event_loop().create_connection(
-            lambda: _RemoteProtocol(self), host, port
-        )
-        asyncio.ensure_future(self._do_connect(coro))
-
-    async def _do_connect(self, coro):
+        host, port = _parse_tcp_addr(backend.url)
         try:
-            transport, _ = await coro
-            self._remote_transport = transport
-            self._remote_ready.set()
-            if self._buffer:
-                transport.write(self._buffer)
-                self._buffer = b""
+            remote_reader, remote_writer = await asyncio.open_connection(host, port)
         except Exception as e:
-            logger.error("Failed to connect remote: %s", e)
-            if self._transport:
-                self._transport.close()
+            logger.error("Failed to connect to backend %s:%s → %s", host, port, e)
+            writer.close()
+            await writer.wait_closed()
+            self._active_connections -= 1
+            return
 
-    def data_received(self, data: bytes):
-        if self._remote_transport:
-            self._remote_transport.write(data)
-        else:
-            self._buffer += data
-
-    def connection_lost(self, exc: Optional[Exception]):
-        if self._remote_transport:
-            self._remote_transport.close()
-        self._transport = None
-
-    def remote_closed(self):
-        if self._transport:
-            self._transport.close()
-        self._remote_transport = None
-
-
-class _RemoteProtocol(asyncio.Protocol):
-    def __init__(self, client_proto: _TCPProxyProtocol):
-        self._client = client_proto
-        self._transport: Optional[asyncio.Transport] = None
-
-    def connection_made(self, transport: asyncio.Transport):
-        self._transport = transport
-
-    def data_received(self, data: bytes):
-        if self._client._transport:
-            self._client._transport.write(data)
-
-    def connection_lost(self, exc: Optional[Exception]):
-        self._client.remote_closed()
-        self._transport = None
+        # Bidirectional pipe
+        try:
+            await asyncio.gather(
+                _pipe(reader, remote_writer, "client→backend"),
+                _pipe(remote_reader, writer, "backend→client"),
+            )
+        except Exception as e:
+            logger.debug("TCP pipe closed: %s", e)
+        finally:
+            for w in (writer, remote_writer):
+                try:
+                    w.close()
+                    await w.wait_closed()
+                except Exception:
+                    pass
+            self._active_connections -= 1
 
 
-def _parse_tcp_addr(url: str) -> tuple:
-    if url.startswith("tcp://"):
-        url = url[6:]
-    elif url.startswith("http://"):
-        url = url[7:]
-    elif url.startswith("https://"):
-        url = url[8:]
-    host, _, port_str = url.partition(":")
+async def _pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, label: str):
+    """Copy data from reader to writer until EOF."""
+    try:
+        while True:
+            data = await reader.read(65536)
+            if not data:
+                break
+            writer.write(data)
+            await writer.drain()
+    except (ConnectionResetError, BrokenPipeError, asyncio.CancelledError):
+        pass
+    finally:
+        try:
+            if writer.can_write_eof():
+                writer.write_eof()
+        except Exception:
+            pass
+
+
+def _parse_tcp_addr(url: str) -> tuple[str, int]:
+    """Parse a URL or host:port string into (host, port)."""
+    for prefix in ("tcp://", "http://", "https://"):
+        if url.startswith(prefix):
+            url = url[len(prefix):]
+            break
+    # Strip trailing path
+    url = url.split("/")[0]
+    host, _, port_str = url.rpartition(":")
+    if not host:
+        host = port_str
+        raise ValueError(f"Cannot parse TCP address (no port): {url}")
     return host, int(port_str)
 
 
+# ---------------------------------------------------------------------------
+# UDP Proxy
+# ---------------------------------------------------------------------------
+
 class UDPProxy:
+    """Layer-4 UDP reverse proxy that relays datagrams to/from backends."""
+
     def __init__(
         self,
         host: str,
@@ -146,9 +150,9 @@ class UDPProxy:
         self._transport: Optional[asyncio.DatagramTransport] = None
 
     async def start(self):
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         self._transport, _ = await loop.create_datagram_endpoint(
-            lambda: _UDPProxyProtocol(self.registry, self.service_name),
+            lambda: _UDPFrontendProtocol(self.registry, self.service_name),
             local_addr=(self.host, self.port),
         )
         logger.info("UDP proxy listening on %s:%s", self.host, self.port)
@@ -158,12 +162,15 @@ class UDPProxy:
             self._transport.close()
 
 
-class _UDPProxyProtocol(asyncio.DatagramProtocol):
+class _UDPFrontendProtocol(asyncio.DatagramProtocol):
+    """Receives datagrams from clients, forwards to backend, relays responses."""
+
     def __init__(self, registry: ServiceRegistry, service_name: str):
         self.registry = registry
         self.service_name = service_name
-        self._remote_transport: Optional[asyncio.DatagramTransport] = None
         self._transport: Optional[asyncio.DatagramTransport] = None
+        # Map backend_addr → client_addr so we can relay responses
+        self._client_map: dict[tuple, tuple] = {}
 
     def connection_made(self, transport: asyncio.DatagramTransport):
         self._transport = transport
@@ -174,8 +181,15 @@ class _UDPProxyProtocol(asyncio.DatagramProtocol):
         if not backend:
             logger.warning("No healthy backend for UDP %s", self.service_name)
             return
-        host, port = _parse_tcp_addr(backend.url)
-        self._transport.sendto(data, (host, port))
+        backend_host, backend_port = _parse_tcp_addr(backend.url)
+        backend_addr = (backend_host, backend_port)
+
+        # Remember which client sent to this backend so we can route replies
+        self._client_map[backend_addr] = addr
+
+        # Forward to backend
+        if self._transport:
+            self._transport.sendto(data, backend_addr)
 
     def error_received(self, exc):
         logger.error("UDP error: %s", exc)

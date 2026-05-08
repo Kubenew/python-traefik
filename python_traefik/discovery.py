@@ -27,6 +27,8 @@ class ProviderConfig:
 
 
 class ServiceDiscoveryProvider(abc.ABC):
+    """Base class for service discovery backends."""
+
     @abc.abstractmethod
     async def discover(self) -> dict[str, list[str]]:
         ...
@@ -37,6 +39,8 @@ class ServiceDiscoveryProvider(abc.ABC):
 
 
 class ConsulProvider(ServiceDiscoveryProvider):
+    """Discover services from HashiCorp Consul catalog."""
+
     def __init__(self, config: ProviderConfig):
         self.config = config
         self._base_url = f"{config.scheme}://{config.address}"
@@ -78,14 +82,29 @@ class ConsulProvider(ServiceDiscoveryProvider):
 
 
 class KubernetesProvider(ServiceDiscoveryProvider):
+    """Discover services from Kubernetes API server."""
+
     def __init__(self, config: ProviderConfig):
         self.config = config
+
+    def _get_token(self) -> str:
+        """Return the configured token, or try to read the in-cluster service account token."""
+        if self.config.token:
+            return self.config.token
+        # Try in-cluster service account
+        sa_path = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+        try:
+            with open(sa_path, "r") as f:
+                return f.read().strip()
+        except FileNotFoundError:
+            return ""
 
     async def discover(self) -> dict[str, list[str]]:
         try:
             base = self.config.address or "https://kubernetes.default.svc"
+            token = self._get_token()
             async with httpx.AsyncClient(timeout=10, verify=False) as client:
-                headers = {"Authorization": f"Bearer {self.config.token}"} if self.config.token else {}
+                headers = {"Authorization": f"Bearer {token}"} if token else {}
                 ns = self.config.namespace
                 resp = await client.get(
                     f"{base}/api/v1/namespaces/{ns}/services",
@@ -101,7 +120,7 @@ class KubernetesProvider(ServiceDiscoveryProvider):
                         continue
                     cluster_ip = spec.get("clusterIP")
                     ports = spec.get("ports", [])
-                    if cluster_ip and ports:
+                    if cluster_ip and cluster_ip != "None" and ports:
                         urls = [f"http://{cluster_ip}:{p['port']}" for p in ports]
                         result[name] = urls
                 return result
@@ -117,6 +136,8 @@ class KubernetesProvider(ServiceDiscoveryProvider):
 
 
 class DiscoveryManager:
+    """Manages multiple discovery providers and syncs with the ServiceRegistry."""
+
     def __init__(self, registry: ServiceRegistry):
         self.registry = registry
         self._providers: list[ServiceDiscoveryProvider] = []
@@ -137,10 +158,10 @@ class DiscoveryManager:
         await asyncio.gather(*self._tasks, return_exceptions=True)
 
     async def _on_discover(self, services: dict[str, list[str]]):
+        """Callback invoked by providers when new service data arrives."""
         for svc_name, urls in services.items():
-            if self.registry.get_service(svc_name):
-                backends = [Backend(url=u) for u in urls]
-                self.registry.services[svc_name].balancer = RoundRobinBalancer(backends)
+            if self.registry.has_service(svc_name):
+                self.registry.update_service(svc_name, urls)
                 logger.info("Updated service %s with %d backends", svc_name, len(urls))
             else:
                 self.registry.register_service(svc_name, urls)

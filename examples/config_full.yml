@@ -1,0 +1,195 @@
+# python-traefik full reference configuration
+# All sections are optional except entryPoints, routers, and services.
+
+entryPoints:
+  web:
+    address: ":8000"
+  websecure:
+    address: ":8443"
+
+# TCP layer-4 proxy entrypoints
+tcpEntryPoints:
+  mysql:
+    address: ":3306"
+    service: "mysql_service"
+    tls: false
+  redis-tls:
+    address: ":6380"
+    service: "redis_service"
+    tls: true
+
+# UDP layer-4 proxy entrypoints
+udpEntryPoints:
+  dns:
+    address: ":5353"
+    service: "dns_service"
+
+routers:
+  # Higher priority matches first
+  api_router:
+    rule: "Host(`api.example.com`) && PathPrefix(`/v1`)"
+    service: "api_service"
+    middlewares:
+      - "rate-limiter"
+      - "basic-auth"
+      - "retry"
+    priority: 100
+    entryPoints:
+      - "web"
+
+  app_router:
+    rule: "Host(`example.com`) && PathPrefix(`/`)"
+    service: "app_service"
+    middlewares:
+      - "rate-limiter"
+      - "circuit-breaker"
+    priority: 10
+    entryPoints:
+      - "web"
+
+  redirect_router:
+    rule: "Host(`example.com`)"
+    service: "app_service"
+    middlewares:
+      - "https-redirect"
+    priority: 5
+    entryPoints:
+      - "web"
+
+  regex_router:
+    rule: "HostRegexp(`^.*\\.staging\\.example\\.com$`) && PathPrefix(`/`)"
+    service: "staging_service"
+    priority: 50
+
+  method_router:
+    rule: "Method(`POST`) && PathPrefix(`/webhooks`)"
+    service: "webhook_service"
+    priority: 80
+
+services:
+  app_service:
+    loadBalancer:
+      servers:
+        - url: "http://localhost:5000"
+        - url: "http://localhost:5001"
+        - url: "http://localhost:5002"
+
+  api_service:
+    loadBalancer:
+      servers:
+        - url: "http://localhost:6000"
+        - url: "http://localhost:6001"
+
+  staging_service:
+    loadBalancer:
+      servers:
+        - url: "http://staging-1:8080"
+
+  webhook_service:
+    loadBalancer:
+      servers:
+        - url: "http://localhost:7000"
+
+  mysql_service:
+    loadBalancer:
+      servers:
+        - url: "tcp://db-primary:3306"
+        - url: "tcp://db-replica:3306"
+
+  redis_service:
+    loadBalancer:
+      servers:
+        - url: "tcp://redis-1:6379"
+
+  dns_service:
+    loadBalancer:
+      servers:
+        - url: "tcp://dns-1:53"
+        - url: "tcp://dns-2:53"
+
+middlewares:
+  rate-limiter:
+    type: "rate-limit"
+    maxRequests: 200
+    windowSeconds: 1
+
+  basic-auth:
+    type: "basic-auth"
+    users:
+      admin: "supersecret"
+      readonly: "viewonly"
+
+  retry:
+    type: "retry"
+    attempts: 3
+
+  circuit-breaker:
+    type: "circuit-breaker"
+    failureThreshold: 5
+    recoveryTimeout: 30.0
+
+  https-redirect:
+    type: "redirect-scheme"
+    scheme: "https"
+    port: 443
+
+  custom-headers:
+    type: "headers"
+    actions:
+      - action: "set"
+        name: "X-Powered-By"
+        value: "python-traefik"
+      - action: "set"
+        name: "Strict-Transport-Security"
+        value: "max-age=31536000; includeSubDomains"
+      - action: "remove"
+        name: "Server"
+
+# TLS / ACME configuration
+tls:
+  enabled: true
+  minVersion: "TLSv1.2"
+  certificates:
+    - certFile: "./certs/example.com.pem"
+      keyFile: "./certs/example.com-key.pem"
+  acme:
+    email: "admin@example.com"
+    domains:
+      - "example.com"
+      - "*.example.com"
+    staging: true
+    certDir: "./certs"
+    challengeType: "tls-alpn-01"
+
+metrics:
+  enabled: true
+  path: "/metrics"
+
+healthcheck:
+  enabled: true
+  interval_seconds: 10
+  timeout_seconds: 3
+  path: "/health"
+
+dashboard:
+  enabled: true
+  address: ":8080"
+
+# Service discovery providers
+providers:
+  consul:
+    type: "consul"
+    address: "consul.service.local:8500"
+    token: ""
+    scheme: "http"
+    pollInterval: 15
+
+  # kubernetes:
+  #   type: "kubernetes"
+  #   address: ""  # auto-detect in-cluster
+  #   namespace: "default"
+  #   pollInterval: 30
+
+logging:
+  level: "INFO"
+  accessLog: true

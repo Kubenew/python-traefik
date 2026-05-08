@@ -19,6 +19,8 @@ logger = logging.getLogger(__name__)
 
 
 class Middleware(ABC):
+    """Base class for all middleware in the pipeline."""
+
     name: str = "base"
 
     @abstractmethod
@@ -27,6 +29,8 @@ class Middleware(ABC):
 
 
 class MiddlewarePipeline:
+    """Chains middleware in LIFO order so the first added runs first."""
+
     def __init__(self, middlewares: list[Middleware] | None = None):
         self._middlewares = middlewares or []
 
@@ -47,6 +51,8 @@ class MiddlewarePipeline:
 
 
 class RateLimiterMiddleware(Middleware):
+    """Token-bucket rate limiter keyed by client IP."""
+
     name = "rate-limit"
 
     def __init__(self, max_requests: int = 100, window_seconds: int = 1):
@@ -61,6 +67,7 @@ class RateLimiterMiddleware(Middleware):
 
         if key not in self._buckets:
             self._buckets[key] = []
+        # Purge expired timestamps
         self._buckets[key] = [t for t in self._buckets[key] if t > window_start]
 
         if len(self._buckets[key]) >= self.max_requests:
@@ -78,6 +85,8 @@ class HeaderAction:
 
 
 class HeadersMiddleware(Middleware):
+    """Manipulate response headers (set / add / remove)."""
+
     name = "headers"
 
     def __init__(self, actions: list[HeaderAction]):
@@ -85,20 +94,28 @@ class HeadersMiddleware(Middleware):
 
     async def handle(self, request: Request, call_next: Callable) -> Response:
         response = await call_next(request)
-        headers = MutableHeaders(scope=response.__dict__)
+        # Build a mutable view of the raw headers list on the response
+        raw_headers = list(response.headers.raw)
         for a in self.actions:
+            header_name = a.name.lower().encode("latin-1")
+            header_value = a.value.encode("latin-1")
             if a.action == "set":
-                headers[a.name] = a.value
+                # Remove existing, then append
+                raw_headers = [(k, v) for k, v in raw_headers if k != header_name]
+                raw_headers.append((header_name, header_value))
             elif a.action == "add":
-                headers.append(a.name, a.value)
+                raw_headers.append((header_name, header_value))
             elif a.action == "remove":
-                headers.pop(a.name, None)
+                raw_headers = [(k, v) for k, v in raw_headers if k != header_name]
+        response.raw_headers = raw_headers
         return response
 
 
 @dataclass
 class RetryMiddleware(Middleware):
-    name = "retry"
+    """Retry failed requests with exponential back-off."""
+
+    name: str = "retry"
     attempts: int = 3
 
     async def handle(self, request: Request, call_next: Callable) -> Response:
@@ -119,7 +136,9 @@ class RetryMiddleware(Middleware):
 
 @dataclass
 class CircuitBreakerMiddleware(Middleware):
-    name: circuit-breaker
+    """Trips open after N consecutive backend failures, resets after timeout."""
+
+    name: str = "circuit-breaker"
     failure_threshold: int = 5
     recovery_timeout: float = 30.0
     _failure_count: int = 0
@@ -148,6 +167,8 @@ class CircuitBreakerMiddleware(Middleware):
 
 
 class BasicAuthMiddleware(Middleware):
+    """HTTP Basic authentication against a user→password dict."""
+
     name = "basic-auth"
 
     def __init__(self, users: dict[str, str]):
@@ -169,6 +190,8 @@ class BasicAuthMiddleware(Middleware):
 
 
 class RedirectSchemeMiddleware(Middleware):
+    """Redirect HTTP → HTTPS (or any scheme)."""
+
     name = "redirect-scheme"
 
     def __init__(self, scheme: str = "https", port: int = 443):
