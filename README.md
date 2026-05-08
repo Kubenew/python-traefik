@@ -2,8 +2,15 @@
 
 A production-grade, Traefik-inspired reverse proxy implemented in Python using asyncio and Starlette.
 
+[![PyPI](https://img.shields.io/pypi/v/python-traefik)](https://pypi.org/project/python-traefik/)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![CI](https://github.com/Kubenew/python-traefik/actions/workflows/ci.yml/badge.svg)](https://github.com/Kubenew/python-traefik/actions)
+[![Ruff](https://img.shields.io/badge/code%20style-ruff-000000.svg)](https://github.com/astral-sh/ruff)
+
+## Demo
+
+![python-traefik demo](demo.gif)
 
 ## Features
 
